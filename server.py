@@ -61,7 +61,7 @@ async def _request(method: str, path: str, body: dict | None = None, params: dic
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.request(method, url, headers=headers, json=body, params=params)
         if resp.status_code >= 400:
-            return {"error": resp.status_code, "detail": resp.text}
+            return {"error": resp.status_code, "detail": f"API request failed with status {resp.status_code}"}
         if resp.status_code == 204:
             return {"status": "success"}
         return resp.json()
@@ -150,7 +150,10 @@ async def create_source(workspace_id: str, name: str, source_type: str, configur
             Facebook Marketing: {"account_ids": ["act_123"], "credentials": {"access_token": "xxx"}}
             Klaviyo: {"api_key": "pk_xxx"}
     """
-    config = json.loads(configuration)
+    try:
+        config = json.loads(configuration)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in configuration: {e}"})
     config["sourceType"] = source_type
     body = {
         "name": name,
@@ -208,7 +211,10 @@ async def create_destination(workspace_id: str, name: str, destination_type: str
         configuration: JSON string with destination-specific config. Example for BigQuery:
             {"project_id": "my-gcp-project", "dataset_id": "raw", "credentials_json": "{...service account json...}", "dataset_location": "EU"}
     """
-    config = json.loads(configuration)
+    try:
+        config = json.loads(configuration)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in configuration: {e}"})
     config["destinationType"] = destination_type
     body = {
         "name": name,
@@ -294,7 +300,10 @@ async def create_connection(
         schedule_type: "cron" (default), or "manual"
         cron_expression: Quartz cron expression in UTC (default: "0 0 6 * * ?" = daily at 06:00 UTC). Only used when schedule_type is "cron".
     """
-    stream_configs = json.loads(streams)
+    try:
+        stream_configs = json.loads(streams)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in streams: {e}"})
     body = {
         "sourceId": source_id,
         "destinationId": destination_id,
@@ -336,7 +345,10 @@ async def update_connection(
     if name:
         body["name"] = name
     if streams:
-        body["configurations"] = {"streams": json.loads(streams)}
+        try:
+            body["configurations"] = {"streams": json.loads(streams)}
+        except json.JSONDecodeError as e:
+            return json.dumps({"error": f"Invalid JSON in streams: {e}"})
     if schedule_type:
         if schedule_type == "cron":
             body["schedule"] = {
