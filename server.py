@@ -51,7 +51,7 @@ async def _get_token() -> str:
 
 
 async def _request(method: str, path: str, body: dict | None = None, params: dict | None = None) -> dict:
-    """Make an authenticated request to the Airbyte API."""
+    """Make an authenticated request to the Airbyte API. Retries once on 401 with a fresh token."""
     token = await _get_token()
     url = AIRBYTE_API_URL.rstrip("/") + path
     headers = {
@@ -60,11 +60,36 @@ async def _request(method: str, path: str, body: dict | None = None, params: dic
     }
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.request(method, url, headers=headers, json=body, params=params)
+        if resp.status_code == 401:
+            # Token might be stale — clear cache and retry once
+            _token_cache["token"] = None
+            _token_cache["expires_at"] = None
+            token = await _get_token()
+            headers["Authorization"] = f"Bearer {token}"
+            resp = await client.request(method, url, headers=headers, json=body, params=params)
         if resp.status_code >= 400:
-            return {"error": resp.status_code, "detail": f"API request failed with status {resp.status_code}"}
+            # Surface the real Airbyte error body — the message/detail tells you WHY it failed.
+            try:
+                detail = resp.json()
+            except Exception:
+                detail = resp.text
+            return {"error": resp.status_code, "detail": detail}
         if resp.status_code == 204:
             return {"status": "success"}
         return resp.json()
+
+
+def _parse_json_arg(value, name: str):
+    """Accept a native dict/list (the MCP client marshals JSON arguments as real
+    objects/arrays) OR a JSON string, and return the parsed structure. This avoids
+    the double-encoding trap where a JSON-in-a-string param arrives at the Airbyte
+    API as a string instead of a structured object. Raises ValueError on bad JSON."""
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON in {name}: {e}")
+    return value
 
 
 # --- MCP Server ---
@@ -137,23 +162,25 @@ async def list_sources(workspace_id: str) -> str:
 
 
 @mcp.tool()
-async def create_source(workspace_id: str, name: str, source_type: str, configuration: str) -> str:
+async def create_source(workspace_id: str, name: str, source_type: str, configuration: dict | str) -> str:
     """Create a new source connector in a workspace.
 
     Args:
         workspace_id: The workspace ID
         name: Display name for this source (e.g. "BYLOTTE Shopify")
         source_type: The source type identifier (e.g. "shopify", "google-ads", "facebook-marketing", "klaviyo")
-        configuration: JSON string with source-specific config. Examples:
+        configuration: Source-specific config as a JSON object (preferred) or JSON string. Examples:
             Shopify: {"shop": "mystore.myshopify.com", "credentials": {"api_password": "shpat_xxx"}}
             Google Ads: {"customer_id": "1234567890", "credentials": {"developer_token": "xxx", "client_id": "xxx", "client_secret": "xxx", "refresh_token": "xxx"}}
             Facebook Marketing: {"account_ids": ["act_123"], "credentials": {"access_token": "xxx"}}
             Klaviyo: {"api_key": "pk_xxx"}
     """
     try:
-        config = json.loads(configuration)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in configuration: {e}"})
+        config = _parse_json_arg(configuration, "configuration")
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+    if not isinstance(config, dict):
+        return json.dumps({"error": "configuration must be a JSON object"})
     config["sourceType"] = source_type
     body = {
         "name": name,
@@ -161,6 +188,47 @@ async def create_source(workspace_id: str, name: str, source_type: str, configur
         "configuration": config,
     }
     data = await _request("POST", "/sources", body=body)
+    return json.dumps(data, indent=2)
+
+
+@mcp.tool()
+async def update_source(source_id: str, name: str | None = None, configuration: dict | str | None = None) -> str:
+    """Update an existing source's name and/or configuration.
+
+    The configuration is a PARTIAL update: pass ONLY the keys you want to change
+    (e.g. {"start_date": "2025-01-01T00:00:00Z"}) and Airbyte merges them into the
+    existing config. You do NOT need to re-send secrets — leave them out and they're
+    preserved. If a replace-style update would drop required fields, Airbyte rejects
+    the call rather than corrupting the source, so this is safe to retry.
+
+    Args:
+        source_id: The source ID to update
+        name: New display name (optional)
+        configuration: JSON object (preferred) or JSON string with only the config keys
+            to change (optional), e.g. {"conversion_window_days": 60}. Nested values like
+            custom_queries_array are passed through as-is.
+    """
+    body: dict = {}
+    if name:
+        body["name"] = name
+    if configuration is not None:
+        try:
+            partial = _parse_json_arg(configuration, "configuration")
+        except ValueError as e:
+            return json.dumps({"error": str(e)})
+        if not isinstance(partial, dict):
+            return json.dumps({"error": "configuration must be a JSON object of keys to change"})
+        # The Airbyte API replaces (not deep-merges) configuration, so fetch the current
+        # config and merge the requested keys on top. Masked secret values ("**********")
+        # are sent back as-is and preserved server-side, so we never need the real secrets.
+        current = await _request("GET", f"/sources/{source_id}")
+        if "error" in current:
+            return json.dumps({"error": "Could not read current source config", "detail": current})
+        merged = {**current.get("configuration", {}), **partial}
+        body["configuration"] = merged
+    if not body:
+        return json.dumps({"error": "Nothing to update: provide name and/or configuration"})
+    data = await _request("PATCH", f"/sources/{source_id}", body=body)
     return json.dumps(data, indent=2)
 
 
@@ -201,20 +269,22 @@ async def list_destinations(workspace_id: str) -> str:
 
 
 @mcp.tool()
-async def create_destination(workspace_id: str, name: str, destination_type: str, configuration: str) -> str:
+async def create_destination(workspace_id: str, name: str, destination_type: str, configuration: dict | str) -> str:
     """Create a new destination connector in a workspace.
 
     Args:
         workspace_id: The workspace ID
         name: Display name (e.g. "BYLOTTE BigQuery")
         destination_type: The destination type (e.g. "bigquery", "snowflake", "postgres")
-        configuration: JSON string with destination-specific config. Example for BigQuery:
+        configuration: Destination-specific config as a JSON object (preferred) or JSON string. Example for BigQuery:
             {"project_id": "my-gcp-project", "dataset_id": "raw", "credentials_json": "{...service account json...}", "dataset_location": "EU"}
     """
     try:
-        config = json.loads(configuration)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in configuration: {e}"})
+        config = _parse_json_arg(configuration, "configuration")
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+    if not isinstance(config, dict):
+        return json.dumps({"error": "configuration must be a JSON object"})
     config["destinationType"] = destination_type
     body = {
         "name": name,
@@ -280,7 +350,7 @@ async def create_connection(
     source_id: str,
     destination_id: str,
     name: str,
-    streams: str,
+    streams: list | str,
     schedule_type: str = "cron",
     cron_expression: str = "0 0 6 * * ?",
 ) -> str:
@@ -290,7 +360,7 @@ async def create_connection(
         source_id: The source ID
         destination_id: The destination ID
         name: Display name (e.g. "BYLOTTE Shopify → BigQuery")
-        streams: JSON string with stream configurations. Example:
+        streams: JSON array (preferred) or JSON string of stream configurations. Example:
             [
                 {"name": "orders", "syncMode": "incremental_append"},
                 {"name": "products", "syncMode": "full_refresh_overwrite"},
@@ -301,9 +371,9 @@ async def create_connection(
         cron_expression: Quartz cron expression in UTC (default: "0 0 6 * * ?" = daily at 06:00 UTC). Only used when schedule_type is "cron".
     """
     try:
-        stream_configs = json.loads(streams)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON in streams: {e}"})
+        stream_configs = _parse_json_arg(streams, "streams")
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
     body = {
         "sourceId": source_id,
         "destinationId": destination_id,
@@ -326,17 +396,20 @@ async def create_connection(
 async def update_connection(
     connection_id: str,
     name: str | None = None,
-    streams: str | None = None,
+    streams: list | str | None = None,
     schedule_type: str | None = None,
     cron_expression: str | None = None,
     status: str | None = None,
 ) -> str:
     """Update an existing connection.
 
+    NOTE: `streams` REPLACES the connection's full stream list (it is not a merge).
+    To flip on / change a single stream while preserving the rest, use enable_stream.
+
     Args:
         connection_id: The connection ID to update
         name: New display name (optional)
-        streams: New stream configuration as JSON string (optional)
+        streams: New full stream configuration as a JSON array (preferred) or JSON string (optional)
         schedule_type: New schedule type: "cron" or "manual" (optional)
         cron_expression: New cron expression (optional, only with schedule_type "cron")
         status: Set connection status: "active" or "inactive" (optional)
@@ -344,11 +417,11 @@ async def update_connection(
     body = {}
     if name:
         body["name"] = name
-    if streams:
+    if streams is not None:
         try:
-            body["configurations"] = {"streams": json.loads(streams)}
-        except json.JSONDecodeError as e:
-            return json.dumps({"error": f"Invalid JSON in streams: {e}"})
+            body["configurations"] = {"streams": _parse_json_arg(streams, "streams")}
+        except ValueError as e:
+            return json.dumps({"error": str(e)})
     if schedule_type:
         if schedule_type == "cron":
             body["schedule"] = {
@@ -360,6 +433,60 @@ async def update_connection(
     if status:
         body["status"] = status
 
+    data = await _request("PATCH", f"/connections/{connection_id}", body=body)
+    return json.dumps(data, indent=2)
+
+
+@mcp.tool()
+async def enable_stream(
+    connection_id: str,
+    stream_name: str,
+    sync_mode: str,
+    cursor_field: list | None = None,
+    primary_key: list | None = None,
+) -> str:
+    """Enable (add) or update a SINGLE stream on an existing connection, preserving every
+    other stream. Reads the connection's current streams, upserts the named one with the
+    given sync mode, and PATCHes. Use this to flip on a newly-discovered stream (run
+    discover_streams first to confirm the source exposes it) without hand-assembling the
+    full stream list.
+
+    Args:
+        connection_id: The connection ID
+        stream_name: The stream (table) name to enable, e.g. "campaign_performance_by_conv_date"
+        sync_mode: One of full_refresh_overwrite, full_refresh_append, incremental_append, incremental_deduped_history
+        cursor_field: Optional cursor field path(s) for incremental modes, e.g. ["segments.date"]
+        primary_key: Optional primary-key field paths for deduped modes, e.g. [["segments.date"], ["campaign.id"]]
+    """
+    current = await _request("GET", f"/connections/{connection_id}")
+    if "error" in current:
+        return json.dumps({"error": "Could not read current connection", "detail": current})
+    streams = current.get("configurations", {}).get("streams", [])
+
+    entry: dict = {"name": stream_name, "syncMode": sync_mode}
+    if cursor_field is not None:
+        entry["cursorField"] = cursor_field
+    if primary_key is not None:
+        entry["primaryKey"] = primary_key
+
+    def _sanitize(s: dict) -> dict:
+        # Airbyte returns selectedFields/mappers as [] on GET (meaning "all fields"),
+        # but on PATCH an empty selectedFields is rejected as "no fields selected".
+        # Drop empty-list keys so preserved streams round-trip cleanly.
+        return {k: v for k, v in s.items() if not (isinstance(v, list) and len(v) == 0)}
+
+    new_streams = []
+    replaced = False
+    for s in streams:
+        if s.get("name") == stream_name:
+            new_streams.append(entry)
+            replaced = True
+        else:
+            new_streams.append(_sanitize(s))
+    if not replaced:
+        new_streams.append(entry)
+
+    body = {"configurations": {"streams": new_streams}}
     data = await _request("PATCH", f"/connections/{connection_id}", body=body)
     return json.dumps(data, indent=2)
 
